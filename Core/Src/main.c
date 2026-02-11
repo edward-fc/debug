@@ -23,12 +23,82 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "MS5611_driver.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+extern FDCAN_HandleTypeDef hfdcan1;
 
+// Make sure these match your actual task handles (CubeMX generates them)
+
+#define CAN_RX_FLAG   (1U << 0)
+#define TEST_STD_ID   (0x123)
+
+extern osThreadId_t CanRxTaskHandle;
+
+static void CAN1_AppInit(void)
+{
+    FDCAN_FilterTypeDef sFilter = {0};
+
+    // Accept StdID 0x123 into FIFO0
+    sFilter.IdType       = FDCAN_STANDARD_ID;
+    sFilter.FilterIndex  = 0;
+    sFilter.FilterType   = FDCAN_FILTER_MASK;
+    sFilter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    sFilter.FilterID1    = TEST_STD_ID;  // ID
+    sFilter.FilterID2    = 0x7FF;        // mask: match all bits
+
+    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilter) != HAL_OK) {
+        printf("[CAN] ConfigFilter failed\r\n");
+        Error_Handler();
+    }
+
+    // Reject everything else (optional but keeps noise down)
+    if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,
+                                    FDCAN_REJECT, FDCAN_REJECT,
+                                    FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK) {
+        printf("[CAN] GlobalFilter failed\r\n");
+        Error_Handler();
+    }
+
+    if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
+        printf("[CAN] Start failed\r\n");
+        Error_Handler();
+    }
+
+    // Enable interrupt callback on RX FIFO0 new message
+    if (HAL_FDCAN_ActivateNotification(&hfdcan1,
+                                       FDCAN_IT_RX_FIFO0_NEW_MESSAGE,
+                                       0) != HAL_OK) {
+        printf("[CAN] ActivateNotification failed\r\n");
+        Error_Handler();
+    }
+
+    printf("[CAN] FDCAN1 started. RX=PA11 TX=PA12, Filter=0x%03X\r\n", TEST_STD_ID);
+}
+
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+    if ((hfdcan->Instance == FDCAN1) && (RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE))
+    {
+        osThreadFlagsSet(CanRxTaskHandle, CAN_RX_FLAG);
+    }
+}
+#define CAN_APP_ID     (0x123)
+
+#define CAN_SOF        (0x01)  // start-of-frame
+#define CAN_COF        (0x02)  // continuation
+#define CAN_MAX_MSG    200     // max reassembled length (adjust)
+
+typedef struct {
+  uint8_t len;
+  char    msg[CAN_MAX_MSG];
+} CanAppMsg_t;
+
+static osMessageQueueId_t canTxQueue;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -45,6 +115,8 @@
 
 COM_InitTypeDef BspCOMInit;
 
+FDCAN_HandleTypeDef hfdcan1;
+
 SPI_HandleTypeDef hspi1;
 
 /* Definitions for Task1 */
@@ -58,7 +130,21 @@ const osThreadAttr_t Task1_attributes = {
 osThreadId_t Task2Handle;
 const osThreadAttr_t Task2_attributes = {
   .name = "Task2",
-  .stack_size = 128 * 4,
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for CanRxTask */
+osThreadId_t CanRxTaskHandle;
+const osThreadAttr_t CanRxTask_attributes = {
+  .name = "CanRxTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for CanTxTask */
+osThreadId_t CanTxTaskHandle;
+const osThreadAttr_t CanTxTask_attributes = {
+  .name = "CanTxTask",
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
@@ -69,8 +155,11 @@ const osThreadAttr_t Task2_attributes = {
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_FDCAN1_Init(void);
 void StartTask1(void *argument);
 void StartTask2(void *argument);
+void StartCanRxTask(void *argument);
+void StartCanTxTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 void MX_FREERTOS_Init(void);
@@ -112,6 +201,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_SPI1_Init();
+  MX_FDCAN1_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -134,6 +224,11 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  canTxQueue = osMessageQueueNew(4, sizeof(CanAppMsg_t), NULL);
+  if (canTxQueue == NULL) {
+    printf("[CAN] Failed to create canTxQueue\r\n");
+    Error_Handler();
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -142,6 +237,12 @@ int main(void)
 
   /* creation of Task2 */
   Task2Handle = osThreadNew(StartTask2, NULL, &Task2_attributes);
+
+  /* creation of CanRxTask */
+  CanRxTaskHandle = osThreadNew(StartCanRxTask, NULL, &CanRxTask_attributes);
+
+  /* creation of CanTxTask */
+  CanTxTaskHandle = osThreadNew(StartCanTxTask, NULL, &CanTxTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -202,7 +303,7 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
@@ -214,14 +315,14 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 24;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 9;
   RCC_OscInitStruct.PLL.PLLP = 2;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLQ = 3;
   RCC_OscInitStruct.PLL.PLLR = 2;
   RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
-  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
-  RCC_OscInitStruct.PLL.PLLFRACN = 0;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOMEDIUM;
+  RCC_OscInitStruct.PLL.PLLFRACN = 3072;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -244,6 +345,59 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief FDCAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_FDCAN1_Init(void)
+{
+
+  /* USER CODE BEGIN FDCAN1_Init 0 */
+
+  /* USER CODE END FDCAN1_Init 0 */
+
+  /* USER CODE BEGIN FDCAN1_Init 1 */
+
+  /* USER CODE END FDCAN1_Init 1 */
+  hfdcan1.Instance = FDCAN1;
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  hfdcan1.Init.Mode = FDCAN_MODE_INTERNAL_LOOPBACK;
+  hfdcan1.Init.AutoRetransmission = DISABLE;
+  hfdcan1.Init.TransmitPause = DISABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
+  hfdcan1.Init.NominalPrescaler = 16;
+  hfdcan1.Init.NominalSyncJumpWidth = 1;
+  hfdcan1.Init.NominalTimeSeg1 = 13;
+  hfdcan1.Init.NominalTimeSeg2 = 2;
+  hfdcan1.Init.DataPrescaler = 1;
+  hfdcan1.Init.DataSyncJumpWidth = 1;
+  hfdcan1.Init.DataTimeSeg1 = 1;
+  hfdcan1.Init.DataTimeSeg2 = 1;
+  hfdcan1.Init.MessageRAMOffset = 0;
+  hfdcan1.Init.StdFiltersNbr = 1;
+  hfdcan1.Init.ExtFiltersNbr = 0;
+  hfdcan1.Init.RxFifo0ElmtsNbr = 8;
+  hfdcan1.Init.RxFifo0ElmtSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.RxFifo1ElmtsNbr = 0;
+  hfdcan1.Init.RxFifo1ElmtSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.RxBuffersNbr = 0;
+  hfdcan1.Init.RxBufferSize = FDCAN_DATA_BYTES_8;
+  hfdcan1.Init.TxEventsNbr = 0;
+  hfdcan1.Init.TxBuffersNbr = 0;
+  hfdcan1.Init.TxFifoQueueElmtsNbr = 8;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  hfdcan1.Init.TxElmtSize = FDCAN_DATA_BYTES_8;
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN FDCAN1_Init 2 */
+
+  /* USER CODE END FDCAN1_Init 2 */
+
 }
 
 /**
@@ -342,47 +496,18 @@ void StartTask1(void *argument)
 {
   /* USER CODE BEGIN 5 */
   M5611_data baro_data;
-  uint8_t init_ok = 0;
-  uint8_t debug_done = 0;
+
+  (void)MS5611_init(&hspi1);
+
   /* Infinite loop */
   for(;;)
   {
-    if (!init_ok) {
-      if (MS5611_init(&hspi1) == 0U) {
-        init_ok = 1U;
-      } else {
-        printf("MS5611 init failed, retrying\r\n");
-        osDelay(1000);
-        continue;
-      }
-    }
-
-    if (!debug_done) {
-      PROM_data prom;
-      uint32_t d1 = 0;
-      uint32_t d2 = 0;
-      MS5611_get_prom(&prom);
-      printf("PROM C1..C6: %u %u %u %u %u %u\r\n",
-             (unsigned)prom.SENS, (unsigned)prom.OFF, (unsigned)prom.TCS,
-             (unsigned)prom.TCO, (unsigned)prom.T_REF, (unsigned)prom.TEMPSENS);
-      printf("PROM CRC: %u\r\n", (unsigned)prom.CRC_code);
-      if (MS5611_read_raw(&d1, &d2) == 0U) {
-        printf("RAW D1: %lu (0x%06lX) D2: %lu (0x%06lX)\r\n",
-          (unsigned long)d1, (unsigned long)d1,
-          (unsigned long)d2, (unsigned long)d2);
-      } else {
-        printf("RAW read failed\r\n");
-      }
-      debug_done = 1U;
-    }
-
-    if (MS5611_get_data(&baro_data) != 0U) {
-      printf("MS5611 read warning\r\n");
-    } else {
-      printf("Temp: %ld.%02ld C, Pressure: %ld Pa\r\n",
+    if (MS5611_get_data(&baro_data) == 0U) {
+      /* TODO: store/publish baro_data */
+      printf("Task-1 Temp: %ld.%02ld C, Pressure: %ld Pa\r\n",
        baro_data.temp/100, labs(baro_data.temp%100), baro_data.pressure);
     }
-    osDelay(1000);
+    osDelay(10000);
   }
   /* USER CODE END 5 */
 }
@@ -396,14 +521,187 @@ void StartTask1(void *argument)
 /* USER CODE END Header_StartTask2 */
 void StartTask2(void *argument)
 {
-  /* USER CODE BEGIN StartTask2 */
-  /* Infinite loop */
-  for(;;)
+  for (;;)
   {
-	printf("Task-2 \n");
-    osDelay(1000);
+	  static CanAppMsg_t m;
+	  memset(&m, 0, sizeof(m));
+	  snprintf(m.msg, sizeof(m.msg), "LURA is the best rocketry team");
+	  m.len = (uint8_t)strlen(m.msg);
+	  osMessageQueuePut(canTxQueue, &m, 0, 0);
+	  printf("[APP] queued msg len=%u\r\n", m.len);
+	  osDelay(2000);
   }
-  /* USER CODE END StartTask2 */
+}
+/* USER CODE END StartTask2 */
+
+
+/* USER CODE BEGIN Header_StartCanRxTask */
+/**
+* @brief Function implementing the CanRxTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartCanRxTask */
+void StartCanRxTask(void *argument)
+{
+  FDCAN_RxHeaderTypeDef rxHeader;
+  uint8_t rxData[8];
+
+  static char    buf[CAN_MAX_MSG];
+  static uint8_t expected_len = 0;
+  static uint8_t written = 0;
+  static uint8_t active = 0;
+
+  CAN1_AppInit();
+  printf("[CAN RX] Ready (reassembly enabled)\r\n");
+
+  for (;;)
+  {
+    while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0)
+    {
+      if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK)
+        continue;
+
+      if (rxHeader.IdType != FDCAN_STANDARD_ID || rxHeader.Identifier != CAN_APP_ID)
+        continue;
+
+      uint8_t type = rxData[0];
+
+      if (type == CAN_SOF)
+      {
+        expected_len = rxData[1];
+        if (expected_len > CAN_MAX_MSG) expected_len = CAN_MAX_MSG;
+
+        memset(buf, 0, sizeof(buf));
+        written = 0;
+        active = 1;
+
+        // copy up to 6 bytes from rxData[2..7]
+        uint8_t chunk = (expected_len >= 6) ? 6 : expected_len;
+        memcpy(&buf[0], &rxData[2], chunk);
+        written = chunk;
+
+        if (written >= expected_len)
+        {
+          printf("[CAN RX] Msg: \"%.*s\"\r\n", expected_len, buf);
+          active = 0;
+        }
+      }
+      else if (type == CAN_COF && active)
+      {
+        // rxData[1] is seq (optional to validate)
+        uint8_t remaining = (uint8_t)(expected_len - written);
+        uint8_t chunk = (remaining >= 6) ? 6 : remaining;
+
+        memcpy(&buf[written], &rxData[2], chunk);
+        written += chunk;
+
+        if (written >= expected_len)
+        {
+          printf("[CAN RX] Msg: \"%.*s\"\r\n", expected_len, buf);
+          active = 0;
+        }
+      }
+    }
+
+    osDelay(5);
+  }
+}
+/* USER CODE BEGIN Header_StartCanTxTask */
+/**
+* @brief Function implementing the CanTxTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartCanTxTask */
+static inline uint32_t dlc_from_len(uint8_t n)
+{
+  switch (n) {
+    case 0: return FDCAN_DLC_BYTES_0;
+    case 1: return FDCAN_DLC_BYTES_1;
+    case 2: return FDCAN_DLC_BYTES_2;
+    case 3: return FDCAN_DLC_BYTES_3;
+    case 4: return FDCAN_DLC_BYTES_4;
+    case 5: return FDCAN_DLC_BYTES_5;
+    case 6: return FDCAN_DLC_BYTES_6;
+    case 7: return FDCAN_DLC_BYTES_7;
+    default:return FDCAN_DLC_BYTES_8;
+  }
+}
+
+void StartCanTxTask(void *argument)
+{
+
+  FDCAN_TxHeaderTypeDef txHeader = {0};
+  uint8_t data[8];
+
+  txHeader.IdType              = FDCAN_STANDARD_ID;
+  txHeader.Identifier          = CAN_APP_ID;
+  txHeader.TxFrameType         = FDCAN_DATA_FRAME;
+  txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  txHeader.BitRateSwitch       = FDCAN_BRS_OFF;
+  txHeader.FDFormat            = FDCAN_CLASSIC_CAN;
+  txHeader.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+  txHeader.MessageMarker       = 0;
+
+  osDelay(250); // let RX init CAN
+  BSP_LED_Toggle(LED_GREEN);
+  osDelay(50);
+  BSP_LED_Toggle(LED_GREEN);
+
+  printf("[CAN TX] Ready. Waiting for queued messages...\r\n");
+
+  for (;;)
+  {
+	static CanAppMsg_t msg;   // not on stack
+	memset(&msg, 0, sizeof(msg));
+    if (osMessageQueueGet(canTxQueue, &msg, NULL, osWaitForever) != osOK)
+      continue;
+
+    if (msg.len == 0) continue;
+    if (msg.len > CAN_MAX_MSG) msg.len = CAN_MAX_MSG;
+
+    // ---- Start frame: [SOF][len][data0..data5] ----
+    memset(data, 0, sizeof(data));
+    data[0] = CAN_SOF;
+    data[1] = msg.len;
+
+    uint8_t copied = 0;
+    uint8_t chunk0 = (msg.len >= 6) ? 6 : msg.len;
+    memcpy(&data[2], &msg.msg[0], chunk0);
+    copied += chunk0;
+
+    txHeader.DataLength = dlc_from_len((uint8_t)(2 + chunk0));
+    while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, data) != HAL_OK) {
+      printf("[CAN TX] SOF send failed\r\n");
+      continue;
+    }
+
+    // ---- Continuation frames: [COF][seq][data...] (6 bytes payload) ----
+    uint8_t seq = 0;
+    while (copied < msg.len)
+    {
+      memset(data, 0, sizeof(data));
+      data[0] = CAN_COF;
+      data[1] = seq++;
+
+      uint8_t remaining = (uint8_t)(msg.len - copied);
+      uint8_t chunk = (remaining >= 6) ? 6 : remaining;
+      memcpy(&data[2], &msg.msg[copied], chunk);
+      copied += chunk;
+
+      txHeader.DataLength = dlc_from_len((uint8_t)(2 + chunk));
+      while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0) osDelay(1);
+
+      if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, data) != HAL_OK) {
+        printf("[CAN TX] COF send failed (seq=%u)\r\n", seq - 1);
+        break;
+      }
+    }
+
+    printf("[CAN TX] Sent message len=%u: \"%.*s\"\r\n", msg.len, msg.len, msg.msg);
+  }
 }
 
 /**

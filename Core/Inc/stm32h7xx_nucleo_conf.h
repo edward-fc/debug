@@ -47,9 +47,7 @@ extern "C" {
   */
 /* Nucleo pin and part number defines */
 #define USE_STM32H7XX_NUCLEO
-#ifndef USE_NUCLEO_144
 #define USE_NUCLEO_144
-#endif
 #define USE_NUCLEO_H753ZI
 
 /* COM define */
